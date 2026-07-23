@@ -4,7 +4,7 @@ import {
 } from "recharts";
 
 /* ===== backend ===== */
-const API_BASE = import.meta.env.VITE_API_BASE || "https://habit-tracker-backend-sigma.vercel.app";
+const API_BASE = "https://habit-backend-eta.vercel.app";
 
 const STUDY_BLOCKS = [
   { key: "Study Block 1", hours: 3.5, window: "3:00–6:30 PM" },
