@@ -89,7 +89,22 @@ function mergePull(prev,pull){
     pageIds[e.date]=e.pageId; });
   const signal=(pull.signal||[]).map(s=>({id:s.pageId,text:s.text||"",done:s.done,pageId:s.pageId}));
   const monthlyTasks=(pull.monthlyTasks||[]).map(t=>({id:t.pageId,text:t.text||"",done:t.done,pageId:t.pageId}));
-  return {...prev,days,signal,monthlyTasks,_pageIds:pageIds};
+  // An older backend won't send quests at all — keep whatever is local rather
+  // than letting an absent key wipe them.
+  if(!Array.isArray(pull.quests)) return {...prev,days,signal,monthlyTasks,_pageIds:pageIds};
+  const quests=pull.quests.map(q=>({
+    id:q.pageId, pageId:q.pageId, name:q.name||"", hours:q.hours||0,
+    done:!!q.done, created:q.created, sessions:[],
+  }));
+  const byId=Object.fromEntries(quests.map(q=>[q.id,q]));
+  // Sessions arrive as a flat list; the relation says which quest each belongs to.
+  (pull.questSessions||[]).forEach(s=>{
+    (s.questIds||[]).forEach(qid=>{ const q=byId[qid]; if(!q) return;
+      q.sessions.push({id:s.pageId,pageId:s.pageId,hours:s.hours||0,at:s.at,source:s.source||"manual",weekend:!!s.weekend}); });
+  });
+  quests.forEach(q=>q.sessions.sort((a,b)=>String(a.at).localeCompare(String(b.at))));
+  const active=pull.quests.find(q=>q.active);
+  return {...prev,days,signal,monthlyTasks,quests,activeQuestId:active?active.pageId:null,_pageIds:pageIds};
 }
 
 /* ===== intro (morphing text) ===== */
@@ -138,6 +153,11 @@ export default function HabitTracker(){
   const [dirty,setDirty]=useState({}); // date -> true (habit/notes changed locally)
 
   useEffect(()=>{ try{localStorage.setItem(LS,JSON.stringify(state));}catch(e){} },[state]);
+
+  // Lets the memoised write-through APIs read current state without re-creating
+  // themselves (and losing in-flight closures) on every keystroke.
+  const stateRef=useRef(state);
+  useEffect(()=>{ stateRef.current=state; },[state]);
 
   // auto-pull on mount
   const doPull=useCallback(async()=>{
@@ -212,12 +232,95 @@ export default function HabitTracker(){
     return { signal:forKey("signal"), tasks:forKey("monthlyTasks") };
   },[]);
 
+  /* ---- Skill Quests: same write-through, across two related Notion dbs ---- */
+  // Quests hold the running total; each logged session is its own row related
+  // back to the quest, so history and pace survive a browser clear.
+  const questApi = useMemo(()=>{
+    const flag = err => setSync(s=>({...s,error:err}));
+    const questsOf = () => stateRef.current.quests||[];
+
+    const add = async name => {
+      name=(name||"").trim(); if(!name) return;
+      const tempId="tmp-"+Date.now()+"-"+Math.random().toString(36).slice(2,6);
+      const makeActive = !stateRef.current.activeQuestId;
+      setState(s=>({...s,
+        quests:[...(s.quests||[]),{id:tempId,pageId:null,name,hours:0,done:false,sessions:[],saving:true}],
+        activeQuestId: makeActive ? tempId : s.activeQuestId}));
+      try{
+        const res=await apiPushOne({db:"quests",create:true,
+          fields:{Quest:name,Hours:0,Done:false,Active:makeActive,Created:iso(new Date())}});
+        setState(s=>({...s,
+          quests:(s.quests||[]).map(q=>q.id===tempId?{...q,id:res.pageId,pageId:res.pageId,saving:false}:q),
+          activeQuestId:s.activeQuestId===tempId?res.pageId:s.activeQuestId}));
+      }catch(e){
+        setState(s=>({...s,quests:(s.quests||[]).map(q=>q.id===tempId?{...q,saving:false,error:true}:q)}));
+        flag(e.message);
+      }
+    };
+
+    // Exactly one row carries Active in Notion, so promoting clears the old one.
+    const promote = async id => {
+      const prevId=stateRef.current.activeQuestId;
+      if(prevId===id) return;
+      setState(s=>({...s,activeQuestId:id}));
+      try{
+        const next=questsOf().find(q=>q.id===id);
+        if(next&&next.pageId) await apiPushOne({db:"quests",pageId:next.pageId,fields:{Active:true}});
+        const prevQ=questsOf().find(q=>q.id===prevId);
+        if(prevQ&&prevQ.pageId) await apiPushOne({db:"quests",pageId:prevQ.pageId,fields:{Active:false}});
+      }catch(e){ flag(e.message); }
+    };
+
+    const remove = async id => {
+      const q=questsOf().find(x=>x.id===id);
+      setState(s=>({...s,quests:(s.quests||[]).filter(x=>x.id!==id),
+        activeQuestId:s.activeQuestId===id?null:s.activeQuestId}));
+      if(!q||!q.pageId) return; // never persisted, nothing to archive
+      try{ await apiPushOne({db:"quests",pageId:q.pageId,archive:true}); }
+      catch(e){ flag(e.message); }
+    };
+
+    const logHours = async (id,hours,source) => {
+      hours=Math.min(hours,CONFIG.SESSION_CAP_H); if(hours<=0) return;
+      const q=questsOf().find(x=>x.id===id); if(!q) return;
+      const h=Math.round(hours*100)/100;
+      const at=new Date(); const weekend=isWeekend(at); const wk=weekKey(at);
+      const total=Math.round((q.hours+h)*100)/100;
+      const done=total>=QUEST_TARGET;
+      const tempId="tmp-"+Date.now()+"-"+Math.random().toString(36).slice(2,6);
+
+      setState(s=>({...s,
+        quests:(s.quests||[]).map(x=>x.id!==id?x:{...x,hours:total,done,
+          sessions:[...(x.sessions||[]),{id:tempId,pageId:null,hours:h,at:at.toISOString(),source,weekend,saving:true}]}),
+        // weekend hours also pay back this week's study debt
+        makeup: weekend
+          ? {...s.makeup,[wk]:[...(s.makeup[wk]||[]),{id:tempId,hours:h,source:"quest",at:at.toISOString()}]}
+          : s.makeup}));
+
+      if(!q.pageId){ flag("Quest is still saving to Notion — that session was kept locally only."); return; }
+      try{
+        const res=await apiPushOne({db:"questSessions",create:true,fields:{
+          Session:`${q.name} · ${at.toLocaleDateString()}`,
+          Hours:h, At:at.toISOString(), Source:source, Weekend:weekend, Quest:[q.pageId]}});
+        setState(s=>({...s,quests:(s.quests||[]).map(x=>x.id!==id?x:{...x,
+          sessions:(x.sessions||[]).map(ss=>ss.id===tempId?{...ss,id:res.pageId,pageId:res.pageId,saving:false}:ss)})}));
+        await apiPushOne({db:"quests",pageId:q.pageId,fields:{Hours:total,Done:done}});
+      }catch(e){
+        setState(s=>({...s,quests:(s.quests||[]).map(x=>x.id!==id?x:{...x,
+          sessions:(x.sessions||[]).map(ss=>ss.id===tempId?{...ss,saving:false,error:true}:ss)})}));
+        flag(e.message);
+      }
+    };
+
+    return { add, promote, remove, logHours };
+  },[]);
+
   return (
     <div className={dark?"dark":"light"} style={THEME}>
       <style>{CSS}</style>
       {intro && <Intro onDone={()=>{setIntro(false);setTimeout(()=>setRevealed(true),60);}}/>}
       <div style={{minHeight:"100vh",background:"var(--background)",color:"var(--foreground)",fontFamily:"var(--sans)"}}>
-        <div style={{maxWidth:960,margin:"0 auto",padding:"28px 20px 80px"}}>
+        <div className="shell">
 
           <Reveal show={revealed} delay={0}>
             <header style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
@@ -245,7 +348,7 @@ export default function HabitTracker(){
           {tab==="today" && <Today cur={cur} setHabit={setHabit} viewDate={viewDate} setViewDate={setViewDate} today={today} summary={summary} state={state} listApi={listApi} winPct={winPct} loading={sync.loading} revealed={revealed}/>}
           {tab==="week" && <Reveal show={revealed} delay={120}><Week summary={summary} state={state} setState={setState} viewDate={viewDate} setViewDate={setViewDate}/></Reveal>}
           {tab==="month" && <Reveal show={revealed} delay={120}><Month state={state} viewDate={viewDate} setViewDate={setViewDate} setTab={setTab} winPct={winPct}/></Reveal>}
-          {tab==="quests" && <Reveal show={revealed} delay={120}><Quests state={state} setState={setState}/></Reveal>}
+          {tab==="quests" && <Reveal show={revealed} delay={120}><Quests state={state} api={questApi}/></Reveal>}
           {tab==="settings" && <Reveal show={revealed} delay={120}><Settings state={state} setState={setState} winPct={winPct} sync={sync} onPull={doPull}/></Reveal>}
         </div>
       </div>
@@ -581,7 +684,7 @@ function Month({state,viewDate,setViewDate,setTab,winPct}){
      weekend  -> logged hours fill the quest bar AND add to that week's payback
    Study blocks are never auto-ticked; you tick those yourself.
    One quest is Active at a time; the rest sit in the queue. Detours count to the active quest. */
-function Quests({state,setState}){
+function Quests({state,api}){
   const quests=state.quests||[];
   const activeId=state.activeQuestId;
   const active=quests.find(q=>q.id===activeId)||null;
@@ -598,31 +701,8 @@ function Quests({state,setState}){
   const weekend=isWeekend(todayD);
   const elapsed=running?(now-running)/3600000:0;
 
-  const addQuest=()=>{ if(!name.trim())return;
-    const q={id:Date.now(),name:name.trim(),hours:0,done:false,sessions:[],created:iso(todayD)};
-    setState(s=>({...s,quests:[...(s.quests||[]),q],activeQuestId:s.activeQuestId??q.id}));
-    setName(""); };
-  const promote=id=>setState(s=>({...s,activeQuestId:id}));
-  const removeQuest=id=>setState(s=>({...s,quests:(s.quests||[]).filter(q=>q.id!==id),activeQuestId:s.activeQuestId===id?null:s.activeQuestId}));
-
-  const logHours=(hours,source)=>{
-    hours=Math.min(hours,CONFIG.SESSION_CAP_H); if(hours<=0||!active) return;
-    const h=Math.round(hours*100)/100;
-    const wk=weekKey(todayD);
-    const stamp=Date.now();
-    setState(s=>{
-      const quests=(s.quests||[]).map(q=> q.id!==active.id?q:{
-        ...q, hours:Math.round((q.hours+h)*100)/100,
-        done:(q.hours+h)>=QUEST_TARGET,
-        sessions:[...(q.sessions||[]),{id:stamp,hours:h,source,at:new Date().toISOString(),weekend}],
-      });
-      // weekend hours also pay back study debt
-      const makeup= weekend
-        ? {...s.makeup,[wk]:[...(s.makeup[wk]||[]),{id:stamp,hours:h,source:"quest",at:new Date().toISOString()}]}
-        : s.makeup;
-      return {...s,quests,makeup};
-    });
-  };
+  const addQuest=()=>{ if(!name.trim())return; api.add(name); setName(""); };
+  const logHours=(hours,source)=>{ if(active) api.logHours(active.id,hours,source); };
 
   return (
     <>
@@ -701,11 +781,12 @@ function Quests({state,setState}){
         <div style={{fontSize:12,color:"var(--muted-foreground)",marginBottom:12}}>Skills waiting their turn. Add as many as you like — only one runs at a time.</div>
         {queue.length===0 && <div style={{fontFamily:"var(--mono)",fontSize:12,color:"var(--muted-foreground)",padding:"6px 0"}}>— empty —</div>}
         {queue.map(q=>(
-          <div key={q.id} className="listrow">
+          <div key={q.id} className="listrow" style={{opacity:q.saving?.6:1}}>
             <span style={{flex:1,fontSize:13.5}}>{q.name}</span>
+            {q.error && <span title="not saved to Notion" style={{color:"var(--destructive)",fontSize:12}}>!</span>}
             <span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--muted-foreground)"}}>{q.hours.toFixed(1)}h</span>
-            <button className="ghost sm" onClick={()=>promote(q.id)}>make active</button>
-            <button className="x" onClick={()=>removeQuest(q.id)}>×</button>
+            <button className="ghost sm" onClick={()=>api.promote(q.id)}>make active</button>
+            <button className="x" onClick={()=>api.remove(q.id)}>×</button>
           </div>
         ))}
         <div style={{display:"flex",gap:6,marginTop:12}}>
@@ -721,7 +802,7 @@ function Quests({state,setState}){
             <div key={q.id} className="listrow">
               <span style={{flex:1,fontSize:13.5}}>{q.name}</span>
               <span style={{fontFamily:"var(--mono)",fontSize:12}}>{q.hours.toFixed(1)}/{QUEST_TARGET}h</span>
-              <button className="ghost sm" onClick={()=>promote(q.id)}>resume</button>
+              <button className="ghost sm" onClick={()=>api.promote(q.id)}>resume</button>
             </div>
           ))}
         </Card>
@@ -819,6 +900,9 @@ const CSS = `
 button { font-family:inherit; cursor:pointer; color:inherit; }
 button:disabled { opacity:.5; cursor:default; }
 button:focus-visible, input:focus-visible, .slider:focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+/* Fills the viewport instead of a narrow centred column — the 960px cap made a
+   laptop screen look like a phone mock-up with dead margins either side. */
+.shell { width:100%; padding:26px clamp(18px,2.6vw,44px) 72px; }
 .eyebrow { font-family:var(--mono); font-size:10.5px; letter-spacing:2px; text-transform:uppercase; color:var(--muted-foreground); }
 .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:22px; margin-bottom:16px; }
 @media (max-width:640px){ .lists-grid{ grid-template-columns:1fr!important; } }
