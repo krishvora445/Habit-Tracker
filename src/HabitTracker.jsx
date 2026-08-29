@@ -57,9 +57,9 @@ function weekSummary(state,ref){
     weekendTarget:Math.min(remaining,CONFIG.WEEKEND_TARGET_CAP),
     cleared:remaining===0&&debt>0, pending:days.filter(x=>x.missed===null).map(x=>x.date) };
 }
-const dayPct = habits => Math.round(ALL_HABITS.filter(h=>habits[h]).length/ALL_HABITS.length*100);
-const habitPct = habits => Math.round(OTHER_HABITS.filter(h=>habits[h]).length/OTHER_HABITS.length*100);
-const studyPct = habits => Math.round(STUDY_BLOCKS.filter(b=>habits[b.key]).length/STUDY_BLOCKS.length*100);
+const dayPct = habits => Math.round(ALL_HABITS.filter(h=>(habits||{})[h]).length/ALL_HABITS.length*100);
+const habitPct = habits => Math.round(OTHER_HABITS.filter(h=>(habits||{})[h]).length/OTHER_HABITS.length*100);
+const studyPct = habits => Math.round(STUDY_BLOCKS.filter(b=>(habits||{})[b.key]).length/STUDY_BLOCKS.length*100);
 
 /* ===== API ===== */
 async function apiPull(){
@@ -898,16 +898,28 @@ function Reps({state,api}){
   const active=campaigns.find(c=>c.id===state.activeCampaignId)||campaigns.find(c=>c.active)||null;
   const [showCreate,setShowCreate]=useState(false);
   return <>
-    <Card>
-      <div style={{display:"flex",justifyContent:"space-between",gap:14,alignItems:"flex-start",flexWrap:"wrap"}}>
-        <div><div className="eyebrow">2,000 Reps</div><h2 style={{margin:"4px 0",fontSize:20}}>You may be 2,000 cold outreaches away.</h2>
-          <div style={{fontSize:12,color:"var(--muted-foreground)"}}>Count deliberate first touches. The $1M is motivation—not a promise or revenue calculation.</div></div>
-        <button className="ghost" onClick={()=>setShowCreate(v=>!v)}>{showCreate?"cancel":"+ new campaign"}</button>
+    {!active&&campaigns.length===0?<section className="reps-empty">
+      <div className="reps-empty-main">
+        <div className="eyebrow">The 2,000 Reps Principle</div>
+        <h2>How many honest attempts stand between you and the result?</h2>
+        <p>Log deliberate first-touch calls, emails, DMs, or in-person approaches. Outcomes matter, but the first job is doing the reps.</p>
+        <button className="solid reps-cta" onClick={()=>setShowCreate(v=>!v)}>{showCreate?"Close setup":"Start a campaign →"}</button>
       </div>
-      {showCreate&&<CampaignForm onSave={d=>{api.addCampaign(d);setShowCreate(false);}}/>}
-    </Card>
-    {!active?<Card><div className="note" style={{margin:0}}>No active campaign. Create one or resume a paused campaign.</div></Card>
-      :<ActiveCampaign campaign={active} batches={batches.filter(b=>b.campaignId===active.id)} api={api}/>}
+      <div className="reps-zero" aria-label="zero of two thousand reps">
+        <span>0000</span><i>/ 2000</i><div className="barwrap"><div className="bar" style={{width:"0%"}}/></div><small>reps completed</small>
+      </div>
+      {showCreate&&<div className="reps-create"><CampaignForm onSave={d=>{api.addCampaign(d);setShowCreate(false);}}/></div>}
+      {!showCreate&&<div className="reps-steps">
+        <div><b>01</b><span>Choose one offer<br/>and audience</span></div>
+        <div><b>02</b><span>Set a deadline<br/>for 2,000 reps</span></div>
+        <div><b>03</b><span>Log the work<br/>without inflating it</span></div>
+      </div>}
+      <div className="reps-disclaimer">$1M is the idea that gets you moving—not a promise or revenue calculation.</div>
+    </section>:<>
+      <Card><div style={{display:"flex",justifyContent:"space-between",gap:14,alignItems:"center",flexWrap:"wrap"}}><div><div className="eyebrow">2,000 Reps</div><h2 style={{margin:"4px 0",fontSize:20}}>Cold outreach, counted honestly.</h2></div>
+        <button className="ghost" onClick={()=>setShowCreate(v=>!v)}>{showCreate?"cancel":"+ new campaign"}</button></div>{showCreate&&<CampaignForm onSave={d=>{api.addCampaign(d);setShowCreate(false);}}/>}</Card>
+      {!active?<Card><div className="empty-inline"><b>No active campaign</b><span>Resume one below or create a new campaign.</span></div></Card>
+        :<ActiveCampaign campaign={active} batches={batches.filter(b=>b.campaignId===active.id)} api={api}/>}</>}
     {campaigns.length>0&&<Card><div className="eyebrow" style={{marginBottom:10}}>Campaign archive</div>
       {campaigns.map(c=>{const s=campaignStats(c,batches.filter(b=>b.campaignId===c.id));return <div key={c.id} className="listrow" style={{opacity:c.saving?.6:1}}>
         <div style={{flex:1}}><b style={{fontSize:13.5}}>{c.name}</b><div style={{fontFamily:"var(--mono)",fontSize:10.5,color:"var(--muted-foreground)"}}>{s.total}/{c.target} reps · {c.status}</div></div>
@@ -929,7 +941,7 @@ function CampaignForm({onSave}){
     <label>Start<input className="inp" type="date" value={form.start} onChange={e=>set("start",e.target.value)}/></label>
     <label>Deadline<input className="inp" type="date" min={form.start} value={form.deadline} onChange={e=>set("deadline",e.target.value)}/></label>
     <label style={{gridColumn:"1/-1"}}>Offer / audience<input className="inp" value={form.description} onChange={e=>set("description",e.target.value)} placeholder="Optional context"/></label>
-    <button className="solid" disabled={!valid} onClick={()=>onSave(form)}>Create campaign</button>
+    <button className="solid" style={{justifySelf:"start"}} disabled={!valid} onClick={()=>onSave(form)}>Create campaign</button>
   </div>;
 }
 
@@ -1082,6 +1094,25 @@ select.inp { appearance:auto; }
 .statsgrid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:16px; }
 .breakgrid { display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:20px; }
 .batch-edit { padding:14px 0; border-bottom:1px solid var(--border); }
+.reps-empty { width:100%; min-height:590px; padding:clamp(32px,5vw,72px); border:1px solid var(--border); border-radius:calc(var(--radius) + 4px); background:var(--card); display:grid; grid-template-columns:minmax(0,1.15fr) minmax(280px,.85fr); gap:clamp(36px,7vw,100px); align-content:center; position:relative; overflow:hidden; }
+.reps-empty::before { content:""; position:absolute; width:440px; height:440px; right:-180px; top:-210px; border:1px solid var(--border); border-radius:50%; box-shadow:0 0 0 60px var(--background),0 0 0 61px var(--border); opacity:.65; pointer-events:none; }
+.reps-empty-main { position:relative; z-index:1; }
+.reps-empty-main h2 { max-width:690px; margin:12px 0 16px; font-size:clamp(30px,4vw,54px); line-height:1.04; letter-spacing:-.045em; }
+.reps-empty-main p { max-width:590px; margin:0; color:var(--muted-foreground); font-size:14px; line-height:1.75; }
+.reps-cta { margin-top:28px; padding:12px 18px; }
+.reps-zero { position:relative; z-index:1; align-self:center; padding:28px; border:1px solid var(--border); border-radius:var(--radius); background:var(--background); }
+.reps-zero span { display:block; font-family:var(--mono); font-size:clamp(48px,6vw,76px); line-height:1; letter-spacing:-.08em; }
+.reps-zero i { display:block; margin-top:7px; font-family:var(--mono); font-size:14px; font-style:normal; color:var(--muted-foreground); }
+.reps-zero small { display:block; margin-top:9px; font-family:var(--mono); font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:var(--muted-foreground); }
+.reps-create { grid-column:1/-1; position:relative; z-index:1; padding-top:24px; border-top:1px solid var(--border); }
+.reps-steps { grid-column:1/-1; display:grid; grid-template-columns:repeat(3,1fr); gap:1px; margin-top:12px; overflow:hidden; border:1px solid var(--border); border-radius:var(--radius); background:var(--border); position:relative; z-index:1; }
+.reps-steps div { display:flex; align-items:center; gap:14px; padding:17px 18px; background:var(--card); }
+.reps-steps b { font-family:var(--mono); font-size:11px; color:var(--muted-foreground); }
+.reps-steps span { font-size:12px; line-height:1.45; }
+.reps-disclaimer { grid-column:1/-1; text-align:center; font-family:var(--mono); font-size:10.5px; color:var(--muted-foreground); position:relative; z-index:1; }
+.empty-inline { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 2px; }
+.empty-inline span { color:var(--muted-foreground); font-size:12px; }
+@media (max-width:800px){ .reps-empty{grid-template-columns:1fr;min-height:0;padding:32px 22px;gap:28px}.reps-zero{max-width:420px;width:100%}.reps-steps{grid-template-columns:1fr}.reps-empty::before{display:none}.empty-inline{align-items:flex-start;flex-direction:column}.formgrid{grid-template-columns:1fr 1fr}.batchgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
 .x { border:none; background:none; color:var(--destructive); font-size:16px; line-height:1; padding:0 2px; }
 .linkbtn { border:none; background:none; color:var(--foreground); text-decoration:underline; font-family:var(--mono); font-size:11.5px; padding:0; }
 .day { border:1px solid var(--border); background:var(--card); border-radius:12px; padding:8px 4px; text-align:center; transition:.12s; }
@@ -1102,7 +1133,7 @@ select.inp { appearance:auto; }
 .ghost.hot { border-color:var(--foreground); color:var(--foreground); }
 .sessrow { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); font-family:var(--mono); font-size:12.5px; }
 .badge { margin-left:8px; font-size:10px; padding:1px 6px; border-radius:8px; background:var(--secondary); color:var(--muted-foreground); }
-.mcell { aspect-ratio:1; border-radius:12px; font-family:var(--mono); font-size:12px; font-weight:600; display:grid; place-items:center; position:relative; transition:.12s; }
+.mcell { height:clamp(68px,7vw,112px); border-radius:12px; font-family:var(--mono); font-size:12px; font-weight:600; display:grid; place-items:center; position:relative; transition:.12s; }
 .skel { position:relative; overflow:hidden; background:var(--secondary); }
 .skel::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,transparent,var(--border),transparent); background-size:800px 100%; animation:shimmer 1.3s infinite linear; }
 .slider { position:relative; height:22px; display:flex; align-items:center; cursor:pointer; touch-action:none; }
