@@ -38,7 +38,7 @@ const fmtH = h => (Number.isInteger(h)? h : h.toFixed(1)) + "h";
 
 const LS = "discipline-ledger-v3";
 const loadState = () => { try { const r=localStorage.getItem(LS); if(r) return JSON.parse(r); } catch(e){} return null; };
-function emptyState(){ return { days:{}, makeup:{}, signal:[], monthlyTasks:[], winPct:75, quests:[], activeQuestId:null }; }
+function emptyState(){ return { days:{}, makeup:{}, signal:[], monthlyTasks:[], winPct:75, quests:[], activeQuestId:null, outreachCampaigns:[], outreachBatches:[], activeCampaignId:null }; }
 const QUEST_TARGET = 20; // hours to competence
 
 function missedForDay(dayISO,habits){ const d=parseISO(dayISO); if(!isDebtDay(d))return 0;
@@ -104,7 +104,19 @@ function mergePull(prev,pull){
   });
   quests.forEach(q=>q.sessions.sort((a,b)=>String(a.at).localeCompare(String(b.at))));
   const active=pull.quests.find(q=>q.active);
-  return {...prev,days,signal,monthlyTasks,quests,activeQuestId:active?active.pageId:null,_pageIds:pageIds};
+  if(!Array.isArray(pull.outreachCampaigns)) return {...prev,days,signal,monthlyTasks,quests,activeQuestId:active?active.pageId:null,_pageIds:pageIds};
+  const outreachCampaigns=pull.outreachCampaigns.map(c=>({
+    id:c.pageId,pageId:c.pageId,name:c.name||"",target:c.target||2000,start:c.start,deadline:c.deadline,
+    status:c.status||"paused",active:!!c.active,description:c.description||"",
+  }));
+  const outreachBatches=(pull.outreachBatches||[]).map(b=>({
+    id:b.pageId,pageId:b.pageId,campaignId:(b.campaignIds||[])[0]||null,attempts:b.attempts||0,
+    channel:b.channel||"call",noResponse:b.noResponse||0,response:b.response||0,
+    conversation:b.conversation||0,meeting:b.meeting||0,sale:b.sale||0,at:b.at,notes:b.notes||"",
+  }));
+  const activeCampaign=pull.outreachCampaigns.find(c=>c.active);
+  return {...prev,days,signal,monthlyTasks,quests,activeQuestId:active?active.pageId:null,
+    outreachCampaigns,outreachBatches,activeCampaignId:activeCampaign?activeCampaign.pageId:null,_pageIds:pageIds};
 }
 
 /* ===== intro (morphing text) ===== */
@@ -315,6 +327,51 @@ export default function HabitTracker(){
     return { add, promote, remove, logHours };
   },[]);
 
+  /* ---- 2,000 Reps: campaigns + full batch history in Notion ---- */
+  const outreachApi = useMemo(()=>{
+    const flag=err=>setSync(s=>({...s,error:err}));
+    const campaignsOf=()=>stateRef.current.outreachCampaigns||[];
+    const batchesOf=()=>stateRef.current.outreachBatches||[];
+    const addCampaign=async data=>{
+      const name=(data.name||"").trim(); if(!name)return;
+      const tempId="tmp-"+Date.now()+"-"+Math.random().toString(36).slice(2,6); const makeActive=!stateRef.current.activeCampaignId;
+      const campaign={id:tempId,pageId:null,name,target:data.target||2000,start:data.start,deadline:data.deadline,
+        status:makeActive?"active":"paused",active:makeActive,description:(data.description||"").trim(),saving:true};
+      setState(s=>({...s,outreachCampaigns:[...(s.outreachCampaigns||[]),campaign],activeCampaignId:makeActive?tempId:s.activeCampaignId}));
+      try{ const res=await apiPushOne({db:"outreachCampaigns",create:true,fields:{Campaign:name,Target:campaign.target,Start:campaign.start,
+          Deadline:campaign.deadline,Status:campaign.status,Active:makeActive,Description:campaign.description}});
+        setState(s=>({...s,outreachCampaigns:(s.outreachCampaigns||[]).map(c=>c.id===tempId?{...c,id:res.pageId,pageId:res.pageId,saving:false}:c),
+          activeCampaignId:s.activeCampaignId===tempId?res.pageId:s.activeCampaignId}));
+      }catch(e){ setState(s=>({...s,outreachCampaigns:(s.outreachCampaigns||[]).map(c=>c.id===tempId?{...c,saving:false,error:true}:c)})); flag(e.message); }
+    };
+    const setStatus=async(id,status)=>{
+      const prevId=stateRef.current.activeCampaignId; const active=status==="active";
+      setState(s=>({...s,activeCampaignId:active?id:(s.activeCampaignId===id?null:s.activeCampaignId),outreachCampaigns:(s.outreachCampaigns||[]).map(c=>
+        c.id===id?{...c,status,active}:active&&c.id===prevId?{...c,status:"paused",active:false}:c)}));
+      try{ const current=campaignsOf().find(c=>c.id===id); if(current?.pageId) await apiPushOne({db:"outreachCampaigns",pageId:current.pageId,fields:{Status:status,Active:active}});
+        if(active&&prevId&&prevId!==id){const old=campaignsOf().find(c=>c.id===prevId);if(old?.pageId)await apiPushOne({db:"outreachCampaigns",pageId:old.pageId,fields:{Status:"paused",Active:false}});}
+      }catch(e){setState(s=>({...s,outreachCampaigns:(s.outreachCampaigns||[]).map(c=>c.id===id?{...c,error:true}:c)}));flag(e.message);}
+    };
+    const addBatch=async(campaignId,data)=>{
+      const campaign=campaignsOf().find(c=>c.id===campaignId); if(!campaign?.pageId){flag("Campaign is still saving to Notion — wait before logging reps.");return;}
+      const tempId="tmp-"+Date.now()+"-"+Math.random().toString(36).slice(2,6); const batch={...data,id:tempId,pageId:null,campaignId,at:new Date().toISOString(),saving:true};
+      setState(s=>({...s,outreachBatches:[...(s.outreachBatches||[]),batch]}));
+      try{const res=await apiPushOne({db:"outreachBatches",create:true,fields:batchFields(batch,campaign)});
+        setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).map(b=>b.id===tempId?{...b,id:res.pageId,pageId:res.pageId,saving:false}:b)}));
+      }catch(e){setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).map(b=>b.id===tempId?{...b,saving:false,error:true}:b)}));flag(e.message);}
+    };
+    const updateBatch=async(id,data)=>{
+      const old=batchesOf().find(b=>b.id===id);if(!old?.pageId)return;const next={...old,...data,saving:true,error:false};
+      setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).map(b=>b.id===id?next:b)}));
+      try{await apiPushOne({db:"outreachBatches",pageId:old.pageId,fields:batchFields(next)});setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).map(b=>b.id===id?{...b,saving:false}:b)}));}
+      catch(e){setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).map(b=>b.id===id?{...b,saving:false,error:true}:b)}));flag(e.message);}
+    };
+    const removeBatch=async id=>{const batch=batchesOf().find(b=>b.id===id);if(!batch)return;setState(s=>({...s,outreachBatches:(s.outreachBatches||[]).filter(b=>b.id!==id)}));
+      try{if(batch.pageId)await apiPushOne({db:"outreachBatches",pageId:batch.pageId,archive:true});}
+      catch(e){setState(s=>({...s,outreachBatches:[...(s.outreachBatches||[]),{...batch,error:true}]}));flag(e.message);}};
+    return {addCampaign,setStatus,addBatch,updateBatch,removeBatch};
+  },[]);
+
   return (
     <div className={dark?"dark":"light"} style={THEME}>
       <style>{CSS}</style>
@@ -337,7 +394,7 @@ export default function HabitTracker(){
 
           <Reveal show={revealed} delay={80}>
             <nav className="tabs">
-              {[["today","Today"],["quests","Quests"],["week","Reckoning"],["month","Record"],["settings","Settings"]].map(([id,l])=>(
+              {[["today","Today"],["quests","Quests"],["reps","Reps"],["week","Reckoning"],["month","Record"],["settings","Settings"]].map(([id,l])=>(
                 <button key={id} onClick={()=>setTab(id)} className={"tab"+(tab===id?" on":"")}>{l}</button>
               ))}
             </nav>
@@ -349,6 +406,7 @@ export default function HabitTracker(){
           {tab==="week" && <Reveal show={revealed} delay={120}><Week summary={summary} state={state} setState={setState} viewDate={viewDate} setViewDate={setViewDate}/></Reveal>}
           {tab==="month" && <Reveal show={revealed} delay={120}><Month state={state} viewDate={viewDate} setViewDate={setViewDate} setTab={setTab} winPct={winPct}/></Reveal>}
           {tab==="quests" && <Reveal show={revealed} delay={120}><Quests state={state} api={questApi}/></Reveal>}
+          {tab==="reps" && <Reveal show={revealed} delay={120}><Reps state={state} api={outreachApi}/></Reveal>}
           {tab==="settings" && <Reveal show={revealed} delay={120}><Settings state={state} setState={setState} winPct={winPct} sync={sync} onPull={doPull}/></Reveal>}
         </div>
       </div>
@@ -821,6 +879,101 @@ function projectDays(quest){
   return "≈ "+Math.ceil(left/perDay)+" more days at "+perDay.toFixed(1)+"h/day";
 }
 
+/* ===== 2,000 REPS ===== */
+const OUTCOMES=[['noResponse','No response'],['response','Response'],['conversation','Conversation'],['meeting','Meeting'],['sale','Sale']];
+function batchFields(b,campaign){return {Batch:`${campaign?.name||"Outreach"} · ${new Date(b.at).toLocaleDateString()}`,Attempts:b.attempts,
+  Channel:b.channel,"No Response":b.noResponse,Response:b.response,Conversation:b.conversation,Meeting:b.meeting,Sale:b.sale,
+  At:b.at,Notes:b.notes||"",...(campaign?.pageId?{Campaign:[campaign.pageId]}:{})};}
+const sum=(xs,key)=>xs.reduce((n,x)=>n+(Number(x[key])||0),0);
+function campaignStats(c,batches){
+  const today=parseISO(iso(new Date())),total=sum(batches,"attempts"),remaining=Math.max(0,c.target-total),start=parseISO(c.start||iso(today)),deadline=parseISO(c.deadline||iso(today));
+  const elapsed=Math.max(1,Math.floor((today-start)/86400000)+1),leftDays=Math.max(0,Math.floor((deadline-today)/86400000)+1);
+  const pace=total/elapsed,required=leftDays>0?remaining/leftDays:(remaining?Infinity:0),projected=pace>0?addDays(new Date(),Math.ceil(remaining/pace)):null;
+  return {total,remaining,pace,required,projected,pct:Math.min(100,total/Math.max(1,c.target)*100)};
+}
+function pct(n,d){return d?Math.round(n/d*1000)/10:0;}
+
+function Reps({state,api}){
+  const campaigns=state.outreachCampaigns||[],batches=state.outreachBatches||[];
+  const active=campaigns.find(c=>c.id===state.activeCampaignId)||campaigns.find(c=>c.active)||null;
+  const [showCreate,setShowCreate]=useState(false);
+  return <>
+    <Card>
+      <div style={{display:"flex",justifyContent:"space-between",gap:14,alignItems:"flex-start",flexWrap:"wrap"}}>
+        <div><div className="eyebrow">2,000 Reps</div><h2 style={{margin:"4px 0",fontSize:20}}>You may be 2,000 cold outreaches away.</h2>
+          <div style={{fontSize:12,color:"var(--muted-foreground)"}}>Count deliberate first touches. The $1M is motivation—not a promise or revenue calculation.</div></div>
+        <button className="ghost" onClick={()=>setShowCreate(v=>!v)}>{showCreate?"cancel":"+ new campaign"}</button>
+      </div>
+      {showCreate&&<CampaignForm onSave={d=>{api.addCampaign(d);setShowCreate(false);}}/>}
+    </Card>
+    {!active?<Card><div className="note" style={{margin:0}}>No active campaign. Create one or resume a paused campaign.</div></Card>
+      :<ActiveCampaign campaign={active} batches={batches.filter(b=>b.campaignId===active.id)} api={api}/>}
+    {campaigns.length>0&&<Card><div className="eyebrow" style={{marginBottom:10}}>Campaign archive</div>
+      {campaigns.map(c=>{const s=campaignStats(c,batches.filter(b=>b.campaignId===c.id));return <div key={c.id} className="listrow" style={{opacity:c.saving?.6:1}}>
+        <div style={{flex:1}}><b style={{fontSize:13.5}}>{c.name}</b><div style={{fontFamily:"var(--mono)",fontSize:10.5,color:"var(--muted-foreground)"}}>{s.total}/{c.target} reps · {c.status}</div></div>
+        {c.error&&<span title="not saved to Notion" style={{color:"var(--destructive)"}}>!</span>}
+        {!c.active&&c.pageId&&<button className="ghost sm" onClick={()=>api.setStatus(c.id,"active")}>make active</button>}
+        {c.active&&<button className="ghost sm" onClick={()=>api.setStatus(c.id,"paused")}>pause</button>}
+        {c.status!=="completed"&&<button className="ghost sm" onClick={()=>api.setStatus(c.id,"completed")}>complete</button>}
+      </div>;})}
+    </Card>}
+  </>;
+}
+
+function CampaignForm({onSave}){
+  const later=iso(addDays(new Date(),90)); const [form,setForm]=useState({name:"",description:"",target:2000,start:iso(new Date()),deadline:later});
+  const set=(k,v)=>setForm(f=>({...f,[k]:v})); const valid=form.name.trim()&&Number(form.target)>0&&form.start&&form.deadline&&form.deadline>=form.start;
+  return <div className="formgrid" style={{marginTop:18}}>
+    <label>Campaign<input className="inp" value={form.name} onChange={e=>set("name",e.target.value)} placeholder="Agency to $1M"/></label>
+    <label>Target<input className="inp" type="number" min="1" value={form.target} onChange={e=>set("target",Number(e.target.value))}/></label>
+    <label>Start<input className="inp" type="date" value={form.start} onChange={e=>set("start",e.target.value)}/></label>
+    <label>Deadline<input className="inp" type="date" min={form.start} value={form.deadline} onChange={e=>set("deadline",e.target.value)}/></label>
+    <label style={{gridColumn:"1/-1"}}>Offer / audience<input className="inp" value={form.description} onChange={e=>set("description",e.target.value)} placeholder="Optional context"/></label>
+    <button className="solid" disabled={!valid} onClick={()=>onSave(form)}>Create campaign</button>
+  </div>;
+}
+
+function ActiveCampaign({campaign,batches,api}){
+  const stats=campaignStats(campaign,batches),channels=['call','email','dm','in-person','other'];
+  const responseTotal=sum(batches,"response")+sum(batches,"conversation")+sum(batches,"meeting")+sum(batches,"sale");
+  const meetingTotal=sum(batches,"meeting")+sum(batches,"sale"),sales=sum(batches,"sale");
+  return <>
+    <Card><div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"baseline",flexWrap:"wrap"}}>
+      <div><div className="eyebrow">Active campaign</div><h2 style={{margin:"4px 0",fontSize:22}}>{campaign.name}</h2><div style={{fontSize:12,color:"var(--muted-foreground)"}}>{campaign.description||"First-touch outreach only"}</div></div>
+      <div style={{fontFamily:"var(--mono)",fontSize:26,fontWeight:600}}>{stats.total}<span style={{fontSize:14,color:"var(--muted-foreground)"}}>/{campaign.target}</span></div></div>
+      <div className="barwrap" style={{height:11}}><div className="bar" style={{width:stats.pct+"%"}}/></div>
+      <div className="statsgrid"><Stat label="remaining" value={stats.remaining}/><Stat label="needed / day" value={stats.required===Infinity?"overdue":stats.required.toFixed(1)}/>
+        <Stat label="actual / day" value={stats.pace.toFixed(1)}/><Stat label="projected" value={stats.projected?iso(stats.projected):"—"}/></div>
+    </Card>
+    <Card><div className="eyebrow" style={{marginBottom:12}}>Log a batch</div><BatchForm onSave={d=>api.addBatch(campaign.id,d)}/></Card>
+    <Card><div className="eyebrow" style={{marginBottom:12}}>Conversion evidence</div>
+      <div className="statsgrid"><Stat label="response rate" value={pct(responseTotal,stats.total)+"%"}/><Stat label="meeting rate" value={pct(meetingTotal,stats.total)+"%"}/><Stat label="sale rate" value={pct(sales,stats.total)+"%"}/></div>
+      <div className="breakgrid"><Breakdown title="By channel" rows={channels.map(k=>[k,sum(batches.filter(b=>b.channel===k),"attempts")])}/>
+        <Breakdown title="By outcome" rows={OUTCOMES.map(([k,l])=>[l,sum(batches,k)])}/></div>
+    </Card>
+    <Card><div className="eyebrow" style={{marginBottom:10}}>Recent batches</div>{batches.length===0?<div className="note" style={{margin:0}}>No outreach logged yet.</div>:
+      [...batches].sort((a,b)=>String(b.at).localeCompare(String(a.at))).map(b=><BatchRow key={b.id} batch={b} api={api}/>)}</Card>
+  </>;
+}
+
+function BatchForm({initial,onSave,onCancel}){
+  const blank={attempts:0,channel:"call",noResponse:0,response:0,conversation:0,meeting:0,sale:0,notes:""}; const [f,setF]=useState(initial||blank);
+  const set=(k,v)=>setF(x=>({...x,[k]:v})); const outcomes=OUTCOMES.reduce((n,[k])=>n+(Number(f[k])||0),0),attempts=Number(f.attempts)||0;
+  const integers=[attempts,...OUTCOMES.map(([k])=>Number(f[k])||0)].every(Number.isInteger),valid=attempts>0&&integers&&outcomes===attempts;
+  return <div><div className="batchgrid"><label>Attempts<input className="inp" type="number" min="1" step="1" value={f.attempts} onChange={e=>set("attempts",Number(e.target.value))}/></label>
+    <label>Channel<select className="inp" value={f.channel} onChange={e=>set("channel",e.target.value)}>{['call','email','dm','in-person','other'].map(x=><option key={x}>{x}</option>)}</select></label>
+    {OUTCOMES.map(([k,l])=><label key={k}>{l}<input className="inp" type="number" min="0" step="1" value={f[k]} onChange={e=>set(k,Math.max(0,Number(e.target.value)))}/></label>)}
+    <label style={{gridColumn:"1/-1"}}>Notes<input className="inp" value={f.notes} onChange={e=>set("notes",e.target.value)} placeholder="Optional context"/></label></div>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}><button className="solid" disabled={!valid} onClick={()=>onSave({...f,attempts})}>{initial?"Save correction":"Log reps"}</button>{onCancel&&<button className="ghost" onClick={onCancel}>cancel</button>}
+      <span style={{fontFamily:"var(--mono)",fontSize:11,color:valid?"var(--muted-foreground)":"var(--destructive)"}}>outcomes {outcomes}/{attempts}</span></div>
+  </div>;
+}
+function Breakdown({title,rows}){return <div><div className="eyebrow" style={{marginBottom:8}}>{title}</div>{rows.map(([l,n])=><div className="sessrow" key={l}><span>{l}</span><b>{n}</b></div>)}</div>;}
+function BatchRow({batch,api}){const [edit,setEdit]=useState(false);if(edit)return <div className="batch-edit"><BatchForm initial={batch} onSave={d=>{api.updateBatch(batch.id,d);setEdit(false);}} onCancel={()=>setEdit(false)}/></div>;
+  return <div className="listrow" style={{opacity:batch.saving?.6:1}}><div style={{flex:1}}><b style={{fontFamily:"var(--mono)",fontSize:13}}>{batch.attempts} · {batch.channel}</b>
+    <div style={{fontSize:11,color:"var(--muted-foreground)"}}>{new Date(batch.at).toLocaleString()} {batch.notes&&`· ${batch.notes}`}</div></div>{batch.error&&<span title="not saved to Notion" style={{color:"var(--destructive)"}}>!</span>}
+    {batch.pageId&&<button className="ghost sm" onClick={()=>setEdit(true)}>edit</button>}<button className="x" title="delete batch" onClick={()=>api.removeBatch(batch.id)}>×</button></div>;}
+
 /* ===== SETTINGS (with slider) ===== */
 function Settings({state,setState,winPct,sync,onPull}){
   const setWin=v=>setState(s=>({...s,winPct:v}));
@@ -905,8 +1058,8 @@ button:focus-visible, input:focus-visible, .slider:focus-visible { outline:2px s
 .shell { width:100%; padding:26px clamp(18px,2.6vw,44px) 72px; }
 .eyebrow { font-family:var(--mono); font-size:10.5px; letter-spacing:2px; text-transform:uppercase; color:var(--muted-foreground); }
 .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:22px; margin-bottom:16px; }
-@media (max-width:640px){ .lists-grid{ grid-template-columns:1fr!important; } }
-.tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:20px; }
+@media (max-width:640px){ .lists-grid{ grid-template-columns:1fr!important; } .statsgrid,.breakgrid,.formgrid,.batchgrid{grid-template-columns:1fr!important;} }
+.tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:20px; overflow-x:auto; }
 .tab { background:none; border:none; padding:9px 16px; font-size:13.5px; font-weight:600; color:var(--muted-foreground); border-bottom:2px solid transparent; margin-bottom:-1px; }
 .tab.on { color:var(--foreground); border-bottom-color:var(--foreground); }
 .study { background:var(--secondary); border-radius:var(--radius); padding:16px; }
@@ -921,6 +1074,14 @@ button:focus-visible, input:focus-visible, .slider:focus-visible { outline:2px s
 .listrow:last-child { border-bottom:none; }
 .inp { background:var(--background); border:1px solid var(--input); border-radius:12px; padding:7px 9px; font-size:13px; color:var(--foreground); font-family:var(--sans); outline:none; }
 .inp:focus { border-color:var(--ring); }
+select.inp { appearance:auto; }
+.formgrid { display:grid; grid-template-columns:2fr 1fr 1fr 1fr; gap:10px; align-items:end; }
+.batchgrid { display:grid; grid-template-columns:repeat(7,minmax(90px,1fr)); gap:10px; }
+.formgrid label,.batchgrid label { display:flex; flex-direction:column; gap:5px; font-family:var(--mono); font-size:10.5px; color:var(--muted-foreground); }
+.formgrid .inp,.batchgrid .inp { width:100%; }
+.statsgrid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:16px; }
+.breakgrid { display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:20px; }
+.batch-edit { padding:14px 0; border-bottom:1px solid var(--border); }
 .x { border:none; background:none; color:var(--destructive); font-size:16px; line-height:1; padding:0 2px; }
 .linkbtn { border:none; background:none; color:var(--foreground); text-decoration:underline; font-family:var(--mono); font-size:11.5px; padding:0; }
 .day { border:1px solid var(--border); background:var(--card); border-radius:12px; padding:8px 4px; text-align:center; transition:.12s; }
